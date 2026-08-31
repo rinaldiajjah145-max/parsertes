@@ -1,17 +1,19 @@
 """
 FULLFILTER_GUI - Realtime Progress & 12 Target Platforms
-(v2.5 - Clean, High-Performance & Multi-Chunking Edition)
+(v2.5 - Refactored: platform detection, I/O and parsing engines)
+
+This file now acts as the GUI/entrypoint only. Parsing, I/O and
+platform detection were moved into the parsertes package to make
+things testable and maintainable.
 """
 
 import sys
 import os
 import asyncio
-import aiofiles
-import re
 import logging
 import subprocess
 from pathlib import Path
-from typing import Optional, Set, Dict, List, Tuple
+from typing import List, Set, Dict, Optional
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -21,6 +23,11 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
+
+# Import the refactored modules
+from parsertes.platform_detect import identify_platform, PLATFORM_PATTERNS
+from parsertes.io_utils import get_txt_files, count_txt_files_in_folder, FileWriter, writer_worker
+from parsertes.parse_engine import process_file_line_mode, process_file_block_mode
 
 # ===============================
 # LOGGING SETUP
@@ -37,13 +44,11 @@ logger = logging.getLogger(__name__)
 RESULT_DIR = "result"
 
 # ===============================
-# SMART DETECTION CONFIGURATION
+# SMART DETECTION CONFIGURATION (kept for parse_block_smart heuristics)
 # ===============================
 CORE_URL_KEYS = {"url", "host", "site", "link", "domain", "address", "uri", "target", "page", "location"}
 CORE_USER_KEYS = {"user", "username", "login", "email", "account", "usr", "mail", "identity", "u"}
 CORE_PASS_KEYS = {"pass", "password", "pwd", "pasw", "secret", "p"}
-
-URL_REGEX_PATTERN = re.compile(r'^(https?://|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:\d+)?)(/.*)?$', re.IGNORECASE)
 
 # ===============================
 # COLOR SCHEME
@@ -65,359 +70,86 @@ class Colors:
     BORDER_CYAN = "#00d9ff"
 
 # ===============================
-# CUSTOM 12 PLATFORMS RULES
+# INITIALIZATION HELPERS
 # ===============================
-PLATFORM_RULES = {
-    "cpanel.txt": [":2083", "/cpanel"],
-    "drupal.txt": ["user/login", "drupal"],
-    "ftp.txt": ["ftp://", ":21"],
-    "joomla.txt": ["/administrator", "joomla"],
-    "moodle.txt": ["moodle", "/login/index.php"],
-    "ojs_journal.txt": ["/index/login", "journal/index.php", "index.php/index/user", "/user/login", "ojs", "jurnal", "ejournal", "e-journal"],
-    "phpmyadmin.txt": ["phpmyadmin"],
-    "plesk.txt": [":8443", "plesk"],
-    "prestashop.txt": ["prestashop", "admin-dev"],
-    "ssh.txt": ["ssh://", ":22"],
-    "whm.txt": [":2087", "/whm"],
-    "wordpress.txt": ["wp-login.php", "wp-admin", "wordpress"],
-}
-
-# ===============================
-# SMART DETECTION ENGINE
-# ===============================
-def normalize_key(raw_key: str) -> str:
-    cleaned = re.sub(r'[^a-zA-Z0-9\s_\-]', '', raw_key)
-    cleaned = re.sub(r'[\s\-]+', '_', cleaned.strip())
-    return cleaned.lower()
-
-def is_smart_match(key_normalized: str, core_keywords: set) -> bool:
-    tokens = key_normalized.split('_')
-    for token in tokens:
-        if token in core_keywords:
-            return True
-    return False
-
-def parse_block_smart(block: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    url = user = pwd = None
-    lines = block.splitlines()
-
-    for line in lines:
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-
-        if ":" in line_clean:
-            key_part, value_part = line_clean.split(":", 1)
-            raw_key = key_part.strip()
-            value = value_part.strip()
-
-            if value:
-                key_norm = normalize_key(raw_key)
-
-                if not url and is_smart_match(key_norm, CORE_URL_KEYS):
-                    url = value
-                    continue
-                elif not user and is_smart_match(key_norm, CORE_USER_KEYS):
-                    user = value
-                    continue
-                elif not pwd and is_smart_match(key_norm, CORE_PASS_KEYS):
-                    pwd = value
-                    continue
-
-        if not url:
-            possible_url = line_clean.split()[0] if line_clean.split() else line_clean
-            if URL_REGEX_PATTERN.match(possible_url):
-                url = possible_url
-
-    return url, user, pwd
-
-# ===============================
-# UTILITY FUNCTIONS
-# ===============================
-def get_txt_files(paths: List[str]) -> Tuple[List[str], Dict[str, int]]:
-    all_files = []
-    stats = {
-        "total_paths": len(paths),
-        "valid_paths": 0,
-        "invalid_paths": 0,
-        "files_found": 0,
-        "folders_scanned": 0,
-    }
-    
-    for path in paths:
-        try:
-            abs_path = os.path.abspath(path)
-            if not os.path.exists(abs_path):
-                stats["invalid_paths"] += 1
-                continue
-            
-            stats["valid_paths"] += 1
-            
-            if os.path.isfile(abs_path):
-                if abs_path.lower().endswith(".txt"):
-                    all_files.append(abs_path)
-                    stats["files_found"] += 1
-            elif os.path.isdir(abs_path):
-                folder_files = 0
-                for root, dirs, files in os.walk(abs_path):
-                    for name in files:
-                        if name.lower().endswith(".txt"):
-                            all_files.append(os.path.join(root, name))
-                            folder_files += 1
-                    stats["folders_scanned"] += len(dirs)
-                stats["files_found"] += folder_files
-        except Exception as e:
-            logger.error(f"Error scanning path {path}: {e}")
-            stats["invalid_paths"] += 1
-    
-    return all_files, stats
-
-def count_txt_files_in_folder(folder_path: str) -> int:
-    if not os.path.isdir(folder_path):
-        return 0
-    try:
-        count = 0
-        for root, _, files in os.walk(folder_path):
-            for name in files:
-                if name.lower().endswith(".txt"):
-                    count += 1
-        return count
-    except Exception:
-        return -1
-
-def split_blocks(text: str) -> List[str]:
-    return [block.strip() for block in text.split("\n\n") if block.strip()]
-
-def identify_platform(url_extracted: str) -> Optional[str]:
-    lower_url = url_extracted.lower()
-
-    if re.search(r"(admin|adam|administratie)[a-z0-9_\-\*@]*/index\.php", lower_url):
-        return "prestashop.txt"
-
-    for filename, keywords in PLATFORM_RULES.items():
-        for kw in keywords:
-            if kw in lower_url:
-                return filename
-                
-    return None
-
-# ===============================
-# ASYNC WRITER ENGINE
-# ===============================
-class FileWriter:
-    def __init__(self, result_dir: str):
-        self.result_dir = result_dir
-        self.opened_files: Dict[str, object] = {}
-        self.write_lock = asyncio.Lock()
-        
-    async def write_line(self, target_file: str, line: str) -> None:
-        async with self.write_lock:
-            try:
-                if target_file not in self.opened_files:
-                    full_path = os.path.join(self.result_dir, target_file)
-                    self.opened_files[target_file] = await aiofiles.open(
-                        full_path, "a", encoding="utf-8", newline='\n'
-                    )
-
-                out = self.opened_files[target_file]
-                await out.write(line + "\n")
-                await out.flush()
-            except Exception as e:
-                logger.error(f"Error writing to {target_file}: {e}")
-
-    async def close_all(self) -> None:
-        try:
-            for filename, f in self.opened_files.items():
-                try:
-                    await f.close()
-                except Exception as e:
-                    logger.warning(f"Error closing {filename}: {e}")
-        finally:
-            self.opened_files.clear()
-
-async def writer_worker(write_queue: asyncio.Queue, file_writer: FileWriter) -> None:
-    try:
-        while True:
-            item = await write_queue.get()
-            if item is None:
-                write_queue.task_done()
-                break
-
-            target_file, line = item
-            await file_writer.write_line(target_file, line)
-            write_queue.task_done()
-    finally:
-        await file_writer.close_all()
-
-# ===============================
-# OPTIMIZED REALTIME PROCESSORS
-# ===============================
-async def process_file_block_mode(
-    path: str, global_set: Set[str],
-    stats: Dict, sem: asyncio.Semaphore, write_queue: asyncio.Queue,
-    callback=None, dedup_enabled=True
-) -> None:
-    async with sem:
-        try:
-            async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = await f.read()
-
-            blocks = split_blocks(content)
-            total_blocks = len(blocks)
-
-            if callback:
-                await callback("log", f"⏳ Memproses {os.path.basename(path)} ({total_blocks:,} blocks)...")
-
-            BATCH_SIZE = 2000
-            local_matches = []
-
-            for i, block in enumerate(blocks, 1):
-                stats["blocks"] += 1
-                url, user, pwd = parse_block_smart(block)
-                if not (url and user and pwd):
-                    continue
-
-                combo_line = f"{url}:{user}:{pwd}"
-
-                if dedup_enabled:
-                    if combo_line in global_set:
-                        continue
-                    global_set.add(combo_line)
-                    stats["unique"] += 1
-                else:
-                    stats["unique"] += 1
-
-                target_file = identify_platform(url)
-                # Hanya simpan jika memenangi match platform (Abaikan Unclassified)
-                if target_file is not None:
-                    stats["matches"] += 1
-                    local_matches.append((target_file, combo_line))
-
-                if i % BATCH_SIZE == 0:
-                    for item in local_matches:
-                        await write_queue.put(item)
-                    local_matches.clear()
-                    await asyncio.sleep(0.001)
-
-            for item in local_matches:
-                await write_queue.put(item)
-
-            stats["files"] += 1
-            if callback:
-                await callback("log", f"✓ Smart Block Mode Selesai: {os.path.basename(path)} ({total_blocks:,} blocks)")
-
-        except Exception as e:
-            if callback:
-                await callback("log", f"✗ Error in {os.path.basename(path)}: {str(e)}")
-
-async def process_file_line_mode(
-    path: str, global_set: Set[str],
-    stats: Dict, sem: asyncio.Semaphore, write_queue: asyncio.Queue,
-    callback=None, dedup_enabled=True
-) -> None:
-    async with sem:
-        try:
-            if callback:
-                await callback("log", f"⏳ Streaming memproses file jumbo {os.path.basename(path)}...")
-
-            BATCH_SIZE = 25000  # Kirim ke queue setiap 25.000 baris agar RAM tetap ringan
-            local_matches = []
-
-            # Membaca baris demi baris (Streaming) tanpa memuat seluruh file ke RAM
-            async with aiofiles.open(path, "r", encoding="utf-8", errors="replace") as f:
-                async for line_str in f:
-                    line_clean = line_str.strip()
-                    if not line_clean:
-                        continue
-
-                    stats["lines"] += 1
-
-                    if dedup_enabled:
-                        if line_clean in global_set:
-                            continue
-                        global_set.add(line_clean)
-                        stats["unique"] += 1
-                    else:
-                        stats["unique"] += 1
-
-                    target_file = identify_platform(line_clean)
-                    if target_file is not None:
-                        stats["matches"] += 1
-                        local_matches.append((target_file, line_clean))
-
-                    if len(local_matches) >= BATCH_SIZE:
-                        for item in local_matches:
-                            await write_queue.put(item)
-                        local_matches.clear()
-                        await asyncio.sleep(0.001)  # Memberi nafas pada CPU & UI
-
-            # Kirim sisa data yang tersisa di buffer
-            for item in local_matches:
-                await write_queue.put(item)
-
-            stats["files"] += 1
-            if callback:
-                await callback("log", f"✓ Line Mode Selesai: {os.path.basename(path)}")
-
-        except Exception as e:
-            if callback:
-                await callback("log", f"✗ Error in {os.path.basename(path)}: {str(e)}")
-
 def initialize_result_directory() -> None:
     os.makedirs(RESULT_DIR, exist_ok=True)
-    for filename in PLATFORM_RULES.keys():
+    # create files for each known platform pattern
+    for filename in PLATFORM_PATTERNS.keys():
         filepath = os.path.join(RESULT_DIR, filename)
         if not os.path.exists(filepath):
             Path(filepath).touch()
+    # file for unclassified combos to help tuning
+    unclassified_path = os.path.join(RESULT_DIR, "unclassified.txt")
+    if not os.path.exists(unclassified_path):
+        Path(unclassified_path).touch()
 
 # ===============================
-# THREAD WORKER
+# THREAD WORKER (UI -> asyncio bridge)
 # ===============================
 class ProcessingThread(QThread):
     progress_update = pyqtSignal(dict)
     log_update = pyqtSignal(str)
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
-    
+
     def __init__(self, file_paths: List[str], parse_mode: str = "line", deduplicate: bool = True, max_concurrency: int = 150):
         super().__init__()
         self.file_paths = file_paths
         self.parse_mode = parse_mode
         self.deduplicate = deduplicate
         self.max_concurrency = max_concurrency
-        self.loop = None
-        
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._running_tasks: List[asyncio.Task] = []
+        self._stop_requested = False
+
     def run(self):
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(self.process())
+            self.loop.run_until_complete(self._run_process())
         except Exception as e:
             self.error.emit(str(e))
         finally:
-            if self.loop:
-                self.loop.close()
-    
-    async def process(self):
+            if self.loop and not self.loop.is_closed():
+                try:
+                    self.loop.close()
+                except Exception:
+                    pass
+
+    def request_stop(self):
+        """Request a graceful stop from the outside (UI thread).
+        This will cancel the running asyncio tasks and let the writer flush.
+        """
+        self._stop_requested = True
+        if self.loop and self._running_tasks:
+            for t in list(self._running_tasks):
+                try:
+                    self.loop.call_soon_threadsafe(t.cancel)
+                except Exception:
+                    pass
+
+    async def _run_process(self):
         try:
             files, file_stats = get_txt_files(self.file_paths)
             if not files:
                 self.error.emit("❌ Tidak ditemukan file .txt sama sekali!")
                 return
-            
+
             self.log_update.emit(
                 f"[★] Memulai pemrosesan {len(files)} file .txt\n"
-                f"    → Target Platforms: 12 Custom Platforms\n"
+                f"    → Target Platforms: {len(PLATFORM_PATTERNS)} Custom Platforms\n"
                 f"    → Mode Parser: {self.parse_mode.upper()} (Multi-Chunk Active)\n"
                 f"    → Max Concurrency: {self.max_concurrency}"
             )
+
             initialize_result_directory()
-            
+
             stats = {
                 "files": 0, "blocks": 0, "lines": 0,
                 "matches": 0, "unique": 0, "total_files": len(files)
             }
-            
+
             global_set: Set[str] = set()
             sem = asyncio.Semaphore(self.max_concurrency)
             write_queue: asyncio.Queue = asyncio.Queue()
@@ -428,8 +160,24 @@ class ProcessingThread(QThread):
                     self.log_update.emit(msg)
 
             writer_task = asyncio.create_task(writer_worker(write_queue, file_writer))
+
+            # choose processor
             processor = process_file_block_mode if self.parse_mode == "block" else process_file_line_mode
 
+            # create processing tasks and keep references so we can cancel them
+            tasks = []
+            for path in files:
+                t = asyncio.create_task(
+                    processor(
+                        path, global_set, stats, sem,
+                        write_queue, log_wrapper, self.deduplicate
+                    )
+                )
+                tasks.append(t)
+
+            self._running_tasks = tasks
+
+            # start a periodic stats updater
             stop_updater = False
 
             async def stats_updater():
@@ -439,25 +187,41 @@ class ProcessingThread(QThread):
 
             updater_task = asyncio.create_task(stats_updater())
 
-            tasks = [
-                processor(
-                    path, global_set, stats, sem,
-                    write_queue, log_wrapper, self.deduplicate
-                )
-                for path in files
-            ]
+            # wait for processors to finish (or be cancelled)
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                # cancellation requested
+                self.log_update.emit("[!] Pemrosesan dibatalkan oleh user...")
+                for t in tasks:
+                    if not t.done():
+                        try:
+                            t.cancel()
+                        except Exception:
+                            pass
+            finally:
+                # ensure writer receives termination sentinel so files flush & close
+                try:
+                    await write_queue.put(None)
+                except Exception:
+                    pass
 
-            await asyncio.gather(*tasks)
+                # wait for writer task to finish
+                try:
+                    await writer_task
+                except Exception as e:
+                    logger.warning(f"Writer task issue: {e}")
 
-            await write_queue.put(None)
-            await writer_task
+                stop_updater = True
+                try:
+                    await updater_task
+                except Exception:
+                    pass
 
-            stop_updater = True
-            await updater_task
-
-            self.log_update.emit("[✓] Pemrosesan 12 Platform Selesai!")
-            self.progress_update.emit(stats)
-            self.finished.emit(stats)
+                # final stats emit and finish
+                self.log_update.emit("[✓] Pemrosesan 12 Platform Selesai!")
+                self.progress_update.emit(stats)
+                self.finished.emit(stats)
 
         except Exception as e:
             self.error.emit(f"Process error: {str(e)}")
@@ -472,8 +236,8 @@ class FilterULPApp(QMainWindow):
         self.resize(950, 680)
         self.setMinimumSize(800, 580)
         
-        self.selected_paths = []
-        self.processing_thread = None
+        self.selected_paths: List[str] = []
+        self.processing_thread: Optional[ProcessingThread] = None
         
         self.init_ui()
         
@@ -727,8 +491,12 @@ class FilterULPApp(QMainWindow):
 
     def stop_processing(self):
         if self.processing_thread and self.processing_thread.isRunning():
-            self.processing_thread.terminate()
-            self.log_console("[🛑] Pemrosesan dihentikan.")
+            # request graceful stop instead of force terminate
+            try:
+                self.processing_thread.request_stop()
+                self.log_console("[🛑] Permintaan penghentian (graceful) dikirim.")
+            except Exception as e:
+                self.log_console(f"[✗] Gagal meminta penghentian: {e}")
             self.reset_ui_state()
 
     def update_progress(self, stats: dict):
